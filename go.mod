@@ -16,7 +16,7 @@ require (
 	github.com/distribution/reference v0.5.0
 	github.com/docker/cli v26.0.1-0.20240410153731-b6c552212837+incompatible // v26.1.0-dev
 	github.com/docker/cli-docs-tool v0.7.0
-	github.com/docker/docker v26.0.0+incompatible
+	github.com/docker/docker v26.1.4+incompatible
 	github.com/docker/go-units v0.5.0
 	github.com/gofrs/flock v0.8.1
 	github.com/gogo/protobuf v1.3.2
