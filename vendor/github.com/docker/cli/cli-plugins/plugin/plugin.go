@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -34,15 +35,9 @@ func RunPlugin(dockerCli *command.DockerCli, plugin *cobra.Command, meta manager
 
 	var persistentPreRunOnce sync.Once
 	PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
-		var err error
+		var retErr error
 		persistentPreRunOnce.Do(func() {
-			cmdContext := cmd.Context()
-			// TODO: revisit and make sure this check makes sense
-			// see: https://github.com/docker/cli/pull/4599#discussion_r1422487271
-			if cmdContext == nil {
-				cmdContext = context.TODO()
-			}
-			ctx, cancel := context.WithCancel(cmdContext)
+			ctx, cancel := context.WithCancel(cmd.Context())
 			cmd.SetContext(ctx)
 			// Set up the context to cancel based on signalling via CLI socket.
 			socket.ConnectAndWait(cancel)
@@ -51,9 +46,28 @@ func RunPlugin(dockerCli *command.DockerCli, plugin *cobra.Command, meta manager
 			if os.Getenv("DOCKER_CLI_PLUGIN_USE_DIAL_STDIO") != "" {
 				opts = append(opts, withPluginClientConn(plugin.Name()))
 			}
-			err = tcmd.Initialize(opts...)
+			opts = append(opts, command.WithEnableGlobalMeterProvider(), command.WithEnableGlobalTracerProvider())
+			retErr = tcmd.Initialize(opts...)
+			ogRunE := cmd.RunE
+			if ogRunE == nil {
+				ogRun := cmd.Run
+				// necessary because error will always be nil here
+				// see: https://github.com/golangci/golangci-lint/issues/1379
+				//nolint:unparam
+				ogRunE = func(cmd *cobra.Command, args []string) error {
+					ogRun(cmd, args)
+					return nil
+				}
+				cmd.Run = nil
+			}
+			cmd.RunE = func(cmd *cobra.Command, args []string) error {
+				stopInstrumentation := dockerCli.StartInstrumentation(cmd)
+				err := ogRunE(cmd, args)
+				stopInstrumentation(err)
+				return err
+			}
 		})
-		return err
+		return retErr
 	}
 
 	cmd, args, err := tcmd.HandleGlobalFlags()
@@ -79,18 +93,17 @@ func Run(makeCmd func(command.Cli) *cobra.Command, meta manager.Metadata) {
 	plugin := makeCmd(dockerCli)
 
 	if err := RunPlugin(dockerCli, plugin, meta); err != nil {
-		if sterr, ok := err.(cli.StatusError); ok {
-			if sterr.Status != "" {
-				fmt.Fprintln(dockerCli.Err(), sterr.Status)
-			}
+		var stErr cli.StatusError
+		if errors.As(err, &stErr) {
 			// StatusError should only be used for errors, and all errors should
 			// have a non-zero exit status, so never exit with 0
-			if sterr.StatusCode == 0 {
-				os.Exit(1)
+			if stErr.StatusCode == 0 { // FIXME(thaJeztah): this should never be used with a zero status-code. Check if we do this anywhere.
+				stErr.StatusCode = 1
 			}
-			os.Exit(sterr.StatusCode)
+			_, _ = fmt.Fprintln(dockerCli.Err(), stErr)
+			os.Exit(stErr.StatusCode)
 		}
-		fmt.Fprintln(dockerCli.Err(), err)
+		_, _ = fmt.Fprintln(dockerCli.Err(), err)
 		os.Exit(1)
 	}
 }
@@ -145,7 +158,7 @@ func newPluginCommand(dockerCli *command.DockerCli, plugin *cobra.Command, meta 
 		CompletionOptions: cobra.CompletionOptions{
 			DisableDefaultCmd:   false,
 			HiddenDefaultCmd:    true,
-			DisableDescriptions: true,
+			DisableDescriptions: os.Getenv("DOCKER_CLI_DISABLE_COMPLETION_DESCRIPTION") != "",
 		},
 	}
 	opts, _ := cli.SetupPluginRootCommand(cmd)

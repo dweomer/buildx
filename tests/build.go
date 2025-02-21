@@ -13,9 +13,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/continuity/fs/fstest"
+	"github.com/containerd/platforms"
 	"github.com/creack/pty"
+	"github.com/docker/buildx/localstate"
+	"github.com/docker/buildx/util/confutil"
+	"github.com/docker/buildx/util/gitutil"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/frontend/subrequests/lint"
 	"github.com/moby/buildkit/frontend/subrequests/outline"
 	"github.com/moby/buildkit/frontend/subrequests/targets"
@@ -40,7 +44,12 @@ func buildCmd(sb integration.Sandbox, opts ...cmdOpt) (string, error) {
 
 var buildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuild,
+	testBuildAlias,
 	testBuildStdin,
+	testBuildRemote,
+	testBuildLocalState,
+	testBuildLocalStateStdin,
+	testBuildLocalStateRemote,
 	testImageIDOutput,
 	testBuildLocalExport,
 	testBuildRegistryExport,
@@ -54,22 +63,31 @@ var buildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildLabelNoKey,
 	testBuildCacheExportNotSupported,
 	testBuildOCIExportNotSupported,
-	testBuildMultiPlatformNotSupported,
+	testBuildMultiPlatform,
 	testDockerHostGateway,
 	testBuildNetworkModeBridge,
 	testBuildShmSize,
 	testBuildUlimit,
-	testBuildMetadata,
+	testBuildMetadataProvenance,
+	testBuildMetadataWarnings,
 	testBuildMultiExporters,
 	testBuildLoadPush,
 	testBuildSecret,
 	testBuildDefaultLoad,
-	testBuildPrint,
+	testBuildCall,
+	testCheckCallOutput,
 }
 
 func testBuild(t *testing.T, sb integration.Sandbox) {
 	dir := createTestProject(t)
 	out, err := buildCmd(sb, withArgs(dir))
+	require.NoError(t, err, string(out))
+}
+
+func testBuildAlias(t *testing.T, sb integration.Sandbox) {
+	dir := createTestProject(t)
+	cmd := buildxCmd(sb, withDir(dir), withArgs("b", dir))
+	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 }
 
@@ -91,6 +109,170 @@ COPY --from=base /etc/bar /bar
 	cmd.Stdin = bytes.NewReader(dockerfile)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
+}
+
+func testBuildRemote(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM busybox:latest
+COPY foo /foo
+`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte("foo"), 0600),
+	)
+	dirDest := t.TempDir()
+
+	git, err := gitutil.New(gitutil.WithWorkingDir(dir))
+	require.NoError(t, err)
+
+	gitutil.GitInit(git, t)
+	gitutil.GitAdd(git, t, "Dockerfile", "foo")
+	gitutil.GitCommit(git, t, "initial commit")
+	addr := gitutil.GitServeHTTP(git, t)
+
+	out, err := buildCmd(sb, withDir(dir), withArgs("--output=type=local,dest="+dirDest, addr))
+	require.NoError(t, err, out)
+	require.FileExists(t, filepath.Join(dirDest, "foo"))
+}
+
+func testBuildLocalState(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM busybox:latest AS base
+COPY foo /etc/foo
+RUN cp /etc/foo /etc/bar
+
+FROM scratch
+COPY --from=base /etc/bar /bar
+`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("build.Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte("foo"), 0600),
+	)
+
+	out, err := buildCmd(sb, withDir(dir), withArgs(
+		"-f", "build.Dockerfile",
+		"--metadata-file", filepath.Join(dir, "md.json"),
+		".",
+	))
+	require.NoError(t, err, out)
+
+	dt, err := os.ReadFile(filepath.Join(dir, "md.json"))
+	require.NoError(t, err)
+
+	type mdT struct {
+		BuildRef string `json:"buildx.build.ref"`
+	}
+	var md mdT
+	err = json.Unmarshal(dt, &md)
+	require.NoError(t, err)
+
+	ls, err := localstate.New(confutil.NewConfig(nil, confutil.WithDir(buildxConfig(sb))))
+	require.NoError(t, err)
+
+	refParts := strings.Split(md.BuildRef, "/")
+	require.Len(t, refParts, 3)
+
+	ref, err := ls.ReadRef(refParts[0], refParts[1], refParts[2])
+	require.NoError(t, err)
+	require.NotNil(t, ref)
+	require.DirExists(t, ref.LocalPath)
+	require.FileExists(t, ref.DockerfilePath)
+}
+
+func testBuildLocalStateStdin(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM busybox:latest AS base
+COPY foo /etc/foo
+RUN cp /etc/foo /etc/bar
+
+FROM scratch
+COPY --from=base /etc/bar /bar
+`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("foo", []byte("foo"), 0600),
+	)
+
+	cmd := buildxCmd(sb, withDir(dir), withArgs("build", "--progress=quiet", "--metadata-file", filepath.Join(dir, "md.json"), "-f-", dir))
+	cmd.Stdin = bytes.NewReader(dockerfile)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	dt, err := os.ReadFile(filepath.Join(dir, "md.json"))
+	require.NoError(t, err)
+
+	type mdT struct {
+		BuildRef string `json:"buildx.build.ref"`
+	}
+	var md mdT
+	err = json.Unmarshal(dt, &md)
+	require.NoError(t, err)
+
+	ls, err := localstate.New(confutil.NewConfig(nil, confutil.WithDir(buildxConfig(sb))))
+	require.NoError(t, err)
+
+	refParts := strings.Split(md.BuildRef, "/")
+	require.Len(t, refParts, 3)
+
+	ref, err := ls.ReadRef(refParts[0], refParts[1], refParts[2])
+	require.NoError(t, err)
+	require.NotNil(t, ref)
+	require.DirExists(t, ref.LocalPath)
+	require.Equal(t, "-", ref.DockerfilePath)
+}
+
+func testBuildLocalStateRemote(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+FROM busybox:latest
+COPY foo /foo
+`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("build.Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte("foo"), 0600),
+	)
+	dirDest := t.TempDir()
+
+	git, err := gitutil.New(gitutil.WithWorkingDir(dir))
+	require.NoError(t, err)
+
+	gitutil.GitInit(git, t)
+	gitutil.GitAdd(git, t, "build.Dockerfile", "foo")
+	gitutil.GitCommit(git, t, "initial commit")
+	addr := gitutil.GitServeHTTP(git, t)
+
+	out, err := buildCmd(sb, withDir(dir), withArgs(
+		"-f", "build.Dockerfile",
+		"--metadata-file", filepath.Join(dirDest, "md.json"),
+		"--output", "type=local,dest="+dirDest,
+		addr,
+	))
+	require.NoError(t, err, out)
+	require.FileExists(t, filepath.Join(dirDest, "foo"))
+
+	dt, err := os.ReadFile(filepath.Join(dirDest, "md.json"))
+	require.NoError(t, err)
+
+	type mdT struct {
+		BuildRef string `json:"buildx.build.ref"`
+	}
+	var md mdT
+	err = json.Unmarshal(dt, &md)
+	require.NoError(t, err)
+
+	ls, err := localstate.New(confutil.NewConfig(nil, confutil.WithDir(buildxConfig(sb))))
+	require.NoError(t, err)
+
+	refParts := strings.Split(md.BuildRef, "/")
+	require.Len(t, refParts, 3)
+
+	ref, err := ls.ReadRef(refParts[0], refParts[1], refParts[2])
+	require.NoError(t, err)
+	require.NotNil(t, ref)
+	require.Equal(t, addr, ref.LocalPath)
+	require.Equal(t, "build.Dockerfile", ref.DockerfilePath)
 }
 
 func testBuildLocalExport(t *testing.T, sb integration.Sandbox) {
@@ -289,7 +471,7 @@ RUN echo foo > /bar`)
 	cmd := buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
-	require.False(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("build details link not expected in output, got %q", out))
+	require.False(t, buildDetailsPattern.MatchString(string(out)), "build details link not expected in output, got %q", out)
 
 	// create desktop-build .lastaccess file
 	home, err := os.UserHomeDir() // TODO: sandbox should create a temp home dir and expose it through its interface
@@ -309,12 +491,7 @@ RUN echo foo > /bar`)
 	cmd = buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
-	require.True(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("expected build details link in output, got %q", out))
-
-	if isExperimental() {
-		// FIXME: https://github.com/docker/buildx/issues/2382
-		t.Skip("build details link not displayed in experimental mode when build fails: https://github.com/docker/buildx/issues/2382")
-	}
+	require.True(t, buildDetailsPattern.MatchString(string(out)), "expected build details link in output, got %q", out)
 
 	// build erroneous dockerfile
 	dockerfile = []byte(`FROM busybox:latest
@@ -323,12 +500,12 @@ RUN exit 1`)
 	cmd = buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
 	out, err = cmd.CombinedOutput()
 	require.Error(t, err, string(out))
-	require.True(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("expected build details link in output, got %q", out))
+	require.True(t, buildDetailsPattern.MatchString(string(out)), "expected build details link in output, got %q", out)
 }
 
 func testBuildProgress(t *testing.T, sb integration.Sandbox) {
 	dir := createTestProject(t)
-	sbDriver, _ := driverName(sb.Name())
+	sbDriver, _, _ := driverName(sb.Name())
 	name := sb.Address()
 
 	// progress=tty
@@ -371,7 +548,7 @@ func testBuildAnnotations(t *testing.T, sb integration.Sandbox) {
 		"--annotation", "example1=www",
 		"--annotation", "index:example2=xxx",
 		"--annotation", "manifest:example3=yyy",
-		"--annotation", "manifest-descriptor[" + platforms.DefaultString() + "]:example4=zzz",
+		"--annotation", "manifest-descriptor[" + platforms.Format(platforms.DefaultSpec()) + "]:example4=zzz",
 	}
 	out, err := buildCmd(sb, withArgs(annotations...), withArgs(fmt.Sprintf("--output=type=image,name=%s,push=true", target), dir))
 	require.NoError(t, err, string(out))
@@ -401,7 +578,7 @@ func testBuildBuildArgNoKey(t *testing.T, sb integration.Sandbox) {
 	cmd := buildxCmd(sb, withArgs("build", "--build-arg", "=TEST_STRING", dir))
 	out, err := cmd.CombinedOutput()
 	require.Error(t, err, string(out))
-	require.Equal(t, strings.TrimSpace(string(out)), `ERROR: invalid key-value pair "=TEST_STRING": empty key`)
+	require.Equal(t, `ERROR: invalid key-value pair "=TEST_STRING": empty key`, strings.TrimSpace(string(out)))
 }
 
 func testBuildLabelNoKey(t *testing.T, sb integration.Sandbox) {
@@ -409,7 +586,7 @@ func testBuildLabelNoKey(t *testing.T, sb integration.Sandbox) {
 	cmd := buildxCmd(sb, withArgs("build", "--label", "=TEST_STRING", dir))
 	out, err := cmd.CombinedOutput()
 	require.Error(t, err, string(out))
-	require.Equal(t, strings.TrimSpace(string(out)), `ERROR: invalid key-value pair "=TEST_STRING": empty key`)
+	require.Equal(t, `ERROR: invalid key-value pair "=TEST_STRING": empty key`, strings.TrimSpace(string(out)))
 }
 
 func testBuildCacheExportNotSupported(t *testing.T, sb integration.Sandbox) {
@@ -436,16 +613,46 @@ func testBuildOCIExportNotSupported(t *testing.T, sb integration.Sandbox) {
 	require.Contains(t, string(out), "OCI exporter is not supported")
 }
 
-func testBuildMultiPlatformNotSupported(t *testing.T, sb integration.Sandbox) {
-	if !isMobyWorker(sb) {
-		t.Skip("only testing with docker worker")
-	}
+func testBuildMultiPlatform(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+	FROM --platform=$BUILDPLATFORM busybox:latest AS base
+	COPY foo /etc/foo
+	RUN cp /etc/foo /etc/bar
 
-	dir := createTestProject(t)
-	cmd := buildxCmd(sb, withArgs("build", "--platform=linux/amd64,linux/arm64", dir))
+	FROM scratch
+	COPY --from=base /etc/bar /bar
+	`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte("foo"), 0600),
+	)
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+	target := registry + "/buildx/registry:latest"
+
+	cmd := buildxCmd(sb, withArgs("build", "--platform=linux/amd64,linux/arm64", fmt.Sprintf("--output=type=image,name=%s,push=true", target), dir))
 	out, err := cmd.CombinedOutput()
-	require.Error(t, err, string(out))
-	require.Contains(t, string(out), "Multi-platform build is not supported")
+
+	if !isMobyWorker(sb) {
+		require.NoError(t, err, string(out))
+
+		desc, provider, err := contentutil.ProviderFromRef(target)
+		require.NoError(t, err)
+		imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
+		require.NoError(t, err)
+
+		img := imgs.Find("linux/amd64")
+		require.NotNil(t, img)
+		img = imgs.Find("linux/arm64")
+		require.NotNil(t, img)
+	} else {
+		require.Error(t, err, string(out))
+		require.Contains(t, string(out), "Multi-platform build is not supported")
+	}
 }
 
 func testDockerHostGateway(t *testing.T, sb integration.Sandbox) {
@@ -560,19 +767,22 @@ COPY --from=build /ulimit /
 	require.Contains(t, string(dt), `1024`)
 }
 
-func testBuildMetadata(t *testing.T, sb integration.Sandbox) {
+func testBuildMetadataProvenance(t *testing.T, sb integration.Sandbox) {
+	t.Run("default", func(t *testing.T) {
+		buildMetadataProvenance(t, sb, "")
+	})
 	t.Run("max", func(t *testing.T) {
-		buildMetadata(t, sb, "max")
+		buildMetadataProvenance(t, sb, "max")
 	})
 	t.Run("min", func(t *testing.T) {
-		buildMetadata(t, sb, "min")
+		buildMetadataProvenance(t, sb, "min")
 	})
 	t.Run("disabled", func(t *testing.T) {
-		buildMetadata(t, sb, "disabled")
+		buildMetadataProvenance(t, sb, "disabled")
 	})
 }
 
-func buildMetadata(t *testing.T, sb integration.Sandbox, metadataMode string) {
+func buildMetadataProvenance(t *testing.T, sb integration.Sandbox, metadataMode string) {
 	dir := createTestProject(t)
 	dirDest := t.TempDir()
 
@@ -614,6 +824,61 @@ func buildMetadata(t *testing.T, sb integration.Sandbox, metadataMode string) {
 	var prv provenancetypes.ProvenancePredicate
 	require.NoError(t, json.Unmarshal(dtprv, &prv))
 	require.Equal(t, provenancetypes.BuildKitBuildType, prv.BuildType)
+}
+
+func testBuildMetadataWarnings(t *testing.T, sb integration.Sandbox) {
+	t.Run("default", func(t *testing.T) {
+		buildMetadataWarnings(t, sb, "")
+	})
+	t.Run("true", func(t *testing.T) {
+		buildMetadataWarnings(t, sb, "true")
+	})
+	t.Run("false", func(t *testing.T) {
+		buildMetadataWarnings(t, sb, "false")
+	})
+}
+
+func buildMetadataWarnings(t *testing.T, sb integration.Sandbox, mode string) {
+	dockerfile := []byte(`
+frOM busybox as base
+cOpy Dockerfile .
+from scratch
+COPy --from=base \
+  /Dockerfile \
+  /
+	`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	cmd := buildxCmd(
+		sb,
+		withArgs("build", "--metadata-file", filepath.Join(dir, "md.json"), dir),
+		withEnv("BUILDX_METADATA_WARNINGS="+mode),
+	)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	dt, err := os.ReadFile(filepath.Join(dir, "md.json"))
+	require.NoError(t, err)
+
+	type mdT struct {
+		BuildRef      string                 `json:"buildx.build.ref"`
+		BuildWarnings []client.VertexWarning `json:"buildx.build.warnings"`
+	}
+	var md mdT
+	err = json.Unmarshal(dt, &md)
+	require.NoError(t, err, string(dt))
+
+	require.NotEmpty(t, md.BuildRef, string(dt))
+	if mode == "" || mode == "false" {
+		require.Empty(t, md.BuildWarnings, string(dt))
+		return
+	}
+
+	skipNoCompatBuildKit(t, sb, ">= 0.14.0-0", "lint")
+	require.Len(t, md.BuildWarnings, 3, string(dt))
 }
 
 func testBuildMultiExporters(t *testing.T, sb integration.Sandbox) {
@@ -797,12 +1062,8 @@ func testBuildDefaultLoad(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, cmd.Run())
 }
 
-func testBuildPrint(t *testing.T, sb integration.Sandbox) {
-	if !isExperimental() {
-		t.Skip("experimental mode required, skipping")
-	}
-
-	t.Run("lint", func(t *testing.T) {
+func testBuildCall(t *testing.T, sb integration.Sandbox) {
+	t.Run("check", func(t *testing.T) {
 		dockerfile := []byte(`
 frOM busybox as base
 cOpy Dockerfile .
@@ -816,12 +1077,12 @@ COPy --from=base \
 			fstest.CreateFile("Dockerfile", dockerfile, 0600),
 		)
 
-		cmd := buildxCmd(sb, withArgs("build", "--print=lint,format=json", dir))
+		cmd := buildxCmd(sb, withArgs("build", "--call=check,format=json", dir))
 		stdout := bytes.Buffer{}
 		stderr := bytes.Buffer{}
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
-		require.NoError(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
 
 		var res lint.LintResults
 		require.NoError(t, json.Unmarshal(stdout.Bytes(), &res))
@@ -851,7 +1112,7 @@ FROM second
 			fstest.CreateFile("Dockerfile", dockerfile, 0600),
 		)
 
-		cmd := buildxCmd(sb, withArgs("build", "--build-arg=BAR=678", "--target=target", "--print=outline,format=json", dir))
+		cmd := buildxCmd(sb, withArgs("build", "--build-arg=BAR=678", "--target=target", "--call=outline,format=json", dir))
 		stdout := bytes.Buffer{}
 		stderr := bytes.Buffer{}
 		cmd.Stdout = &stdout
@@ -901,7 +1162,7 @@ FROM second AS binary
 			fstest.CreateFile("Dockerfile", dockerfile, 0600),
 		)
 
-		cmd := buildxCmd(sb, withArgs("build", "--print=targets,format=json", dir))
+		cmd := buildxCmd(sb, withArgs("build", "--call=targets,format=json", dir))
 		stdout := bytes.Buffer{}
 		stderr := bytes.Buffer{}
 		cmd.Stdout = &stdout
@@ -927,6 +1188,126 @@ FROM second AS binary
 		assert.Equal(t, true, res.Targets[3].Default)
 
 		require.Equal(t, 1, len(res.Sources))
+	})
+
+	t.Run("check metadata", func(t *testing.T) {
+		dockerfile := []byte(`
+frOM busybox as base
+cOpy Dockerfile .
+from scratch
+COPy --from=base \
+  /Dockerfile \
+  /
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		)
+
+		cmd := buildxCmd(sb, withArgs("build", "--call=check,format=json", "--metadata-file", filepath.Join(dir, "md.json"), dir))
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+
+		var res lint.LintResults
+		require.NoError(t, json.Unmarshal(stdout.Bytes(), &res), stdout.String())
+		require.Len(t, res.Warnings, 3)
+
+		dt, err := os.ReadFile(filepath.Join(dir, "md.json"))
+		require.NoError(t, err)
+
+		type mdT struct {
+			BuildRef   string           `json:"buildx.build.ref"`
+			ResultJSON lint.LintResults `json:"result.json"`
+		}
+		var md mdT
+		require.NoError(t, json.Unmarshal(dt, &md), dt)
+		require.Empty(t, md.BuildRef)
+		require.Len(t, md.ResultJSON.Warnings, 3)
+	})
+}
+
+func testCheckCallOutput(t *testing.T, sb integration.Sandbox) {
+	t.Run("check for warning count msg in check without warnings", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox AS base
+COPY Dockerfile .
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		)
+
+		cmd := buildxCmd(sb, withArgs("build", "--call=check", dir))
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.NoError(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), "Check complete, no warnings found.")
+	})
+
+	t.Run("check for warning count msg in check with single warning", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox as base
+COPY Dockerfile .
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		)
+
+		cmd := buildxCmd(sb, withArgs("build", "--call=check", dir))
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), "Check complete, 1 warning has been found!")
+	})
+
+	t.Run("check for warning count msg in check with multiple warnings", func(t *testing.T) {
+		dockerfile := []byte(`
+frOM busybox as base
+cOpy Dockerfile .
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		)
+
+		cmd := buildxCmd(sb, withArgs("build", "--call=check", dir))
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), "Check complete, 2 warnings have been found!")
+	})
+
+	t.Run("check for Dockerfile path printed with context when displaying rule check warnings", func(t *testing.T) {
+		dockerfile := []byte(`
+frOM busybox as base
+cOpy Dockerfile .
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateDir("subdir", 0700),
+			fstest.CreateFile("subdir/Dockerfile", dockerfile, 0600),
+		)
+		dockerfilePath := filepath.Join(dir, "subdir", "Dockerfile")
+
+		cmd := buildxCmd(sb, withArgs("build", "--call=check", "-f", dockerfilePath, dir))
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), "Check complete, 2 warnings have been found!")
+		require.Contains(t, stdout.String(), dockerfilePath+":2")
+		require.Contains(t, stdout.String(), dockerfilePath+":3")
 	})
 }
 

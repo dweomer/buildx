@@ -7,6 +7,9 @@ variable "DOCS_FORMATS" {
 variable "DESTDIR" {
   default = "./bin"
 }
+variable "TEST_COVERAGE" {
+  default = null
+}
 variable "GOLANGCI_LINT_MULTIPLATFORM" {
   default = ""
 }
@@ -28,7 +31,7 @@ group "default" {
 }
 
 group "validate" {
-  targets = ["lint", "lint-gopls", "validate-vendor", "validate-docs"]
+  targets = ["lint", "lint-gopls", "validate-golangci", "validate-vendor", "validate-docs"]
 }
 
 target "lint" {
@@ -38,14 +41,26 @@ target "lint" {
   platforms = GOLANGCI_LINT_MULTIPLATFORM != "" ? [
     "darwin/amd64",
     "darwin/arm64",
+    "freebsd/amd64",
+    "freebsd/arm64",
     "linux/amd64",
     "linux/arm64",
     "linux/s390x",
     "linux/ppc64le",
     "linux/riscv64",
+    "openbsd/amd64",
+    "openbsd/arm64",
     "windows/amd64",
     "windows/arm64"
   ] : []
+}
+
+target "validate-golangci" {
+  description = "Validate .golangci.yml schema (does not run Go linter)"
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/lint.Dockerfile"
+  target = "validate-golangci"
+  output = ["type=cacheonly"]
 }
 
 target "lint-gopls" {
@@ -143,6 +158,8 @@ target "binaries-cross" {
   platforms = [
     "darwin/amd64",
     "darwin/arm64",
+    "freebsd/amd64",
+    "freebsd/arm64",
     "linux/amd64",
     "linux/arm/v6",
     "linux/arm/v7",
@@ -150,6 +167,8 @@ target "binaries-cross" {
     "linux/ppc64le",
     "linux/riscv64",
     "linux/s390x",
+    "openbsd/amd64",
+    "openbsd/arm64",
     "windows/amd64",
     "windows/arm64"
   ]
@@ -192,6 +211,7 @@ variable "TEST_BUILDKIT_TAG" {
 target "integration-test-base" {
   inherits = ["_common"]
   args = {
+    GO_EXTRA_FLAGS = TEST_COVERAGE == "1" ? "-cover" : null
     HTTP_PROXY = HTTP_PROXY
     HTTPS_PROXY = HTTPS_PROXY
     NO_PROXY = NO_PROXY
@@ -204,4 +224,19 @@ target "integration-test-base" {
 target "integration-test" {
   inherits = ["integration-test-base"]
   target = "integration-test"
+}
+
+variable "GOVULNCHECK_FORMAT" {
+  default = null
+}
+
+target "govulncheck" {
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/govulncheck.Dockerfile"
+  target = "output"
+  args = {
+    FORMAT = GOVULNCHECK_FORMAT
+  }
+  no-cache-filter = ["run"]
+  output = ["${DESTDIR}"]
 }

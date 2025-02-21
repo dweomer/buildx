@@ -14,8 +14,17 @@ import (
 	"github.com/pkg/errors"
 )
 
-var ErrNotRunning = errors.Errorf("driver not running")
-var ErrNotConnecting = errors.Errorf("driver not connecting")
+type ErrNotRunning struct{}
+
+func (ErrNotRunning) Error() string {
+	return "driver not running"
+}
+
+type ErrNotConnecting struct{}
+
+func (ErrNotConnecting) Error() string {
+	return "driver not connecting"
+}
 
 type Status int
 
@@ -83,6 +92,11 @@ func ParseBuilderName(name string) (string, error) {
 
 func Boot(ctx, clientContext context.Context, d *DriverHandle, pw progress.Writer) (*client.Client, error) {
 	try := 0
+	logger := discardLogger
+	if pw != nil {
+		logger = pw.Write
+	}
+
 	for {
 		info, err := d.Info(ctx)
 		if err != nil {
@@ -93,14 +107,14 @@ func Boot(ctx, clientContext context.Context, d *DriverHandle, pw progress.Write
 			if try > 2 {
 				return nil, errors.Errorf("failed to bootstrap %T driver in attempts", d)
 			}
-			if err := d.Bootstrap(ctx, pw.Write); err != nil {
+			if err := d.Bootstrap(ctx, logger); err != nil {
 				return nil, err
 			}
 		}
 
 		c, err := d.Client(clientContext)
 		if err != nil {
-			if errors.Cause(err) == ErrNotRunning && try <= 2 {
+			if errors.Is(err, ErrNotRunning{}) && try <= 2 {
 				continue
 			}
 			return nil, err
@@ -108,6 +122,8 @@ func Boot(ctx, clientContext context.Context, d *DriverHandle, pw progress.Write
 		return c, nil
 	}
 }
+
+func discardLogger(*client.SolveStatus) {}
 
 func historyAPISupported(ctx context.Context, c *client.Client) bool {
 	cl, err := c.ControlClient().ListenBuildHistory(ctx, &controlapi.BuildHistoryRequest{
