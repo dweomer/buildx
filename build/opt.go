@@ -213,18 +213,27 @@ func (l *policyProgressLogger) sendVertexComplete(started time.Time, err error) 
 	l.ch <- &client.SolveStatus{Vertexes: []*client.Vertex{&vtx}}
 }
 
-func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *Options, bopts gateway.BuildOpts, cfg *confutil.Config, pw progress.Writer, docker *dockerutil.Client) (_ *client.SolveOpt, release func(), err error) {
+func isPolicyEvaluationError(policies []*policy.Policy, err error) bool {
+	for _, p := range policies {
+		if p != nil && p.IsPolicyError(err) {
+			return true
+		}
+	}
+	return false
+}
+
+func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *Options, bopts gateway.BuildOpts, cfg *confutil.Config, pw progress.Writer, docker *dockerutil.Client) (_ *client.SolveOpt, release func(error), err error) {
 	nodeDriver := node.Driver
-	defers := make([]func(), 0, 2)
-	releaseF := func() {
+	defers := make([]func(error), 0, 2)
+	releaseF := func(inErr error) {
 		for _, f := range defers {
-			f()
+			f(inErr)
 		}
 	}
 
 	defer func() {
 		if err != nil {
-			releaseF()
+			releaseF(err)
 		}
 	}()
 
@@ -432,7 +441,9 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 					if err != nil {
 						return nil, nil, err
 					}
-					defers = append(defers, cancel)
+					defers = append(defers, func(error) {
+						cancel()
+					})
 					opt.Exports[i].Output = func(_ map[string]string) (io.WriteCloser, error) {
 						return w, nil
 					}
@@ -478,7 +489,9 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 	if err != nil {
 		return nil, nil, err
 	}
-	defers = append(defers, releaseLoad)
+	defers = append(defers, func(error) {
+		releaseLoad()
+	})
 
 	if opt.Inputs.policy == nil {
 		if len(opt.Policy) > 0 {
@@ -512,8 +525,13 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 		if len(policyFiles) > 0 {
 			policyLogger = newPolicyProgressLogger(pw, fmt.Sprintf("loading policies %s", strings.Join(policyFiles, ", ")))
 		}
+		var policies []*policy.Policy
 		if policyLogger != nil {
-			defers = append(defers, func() {
+			defers = append(defers, func(inErr error) {
+				if len(policysession.DenyMessages(inErr)) > 0 || isPolicyEvaluationError(policies, inErr) {
+					policyLogger.Close(inErr)
+					return
+				}
 				policyLogger.Close(nil)
 			})
 		}
@@ -537,6 +555,7 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt *O
 				VerifierProvider: policy.SignatureVerifier(cfg),
 				DefaultPlatform:  defaultPlatform(bopts),
 			})
+			policies = append(policies, p)
 			cbs = append(cbs, p.CheckPolicy)
 			if popt.Strict {
 				if bopts.LLBCaps.Supports(pb.CapSourcePolicySession) != nil {

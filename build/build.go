@@ -272,18 +272,18 @@ func warnOnNoOutput(ctx context.Context, nodes []builder.Node, opts map[string]O
 	logrus.Warnf("%s. Build result will only remain in the build cache. To push result image into registry use --push or to load image into docker use --load", warnNoOutputBuf.String())
 }
 
-func newBuildRequests(ctx context.Context, docker *dockerutil.Client, cfg *confutil.Config, drivers map[string][]*noderesolver.ResolvedNode, w progress.Writer, opts map[string]Options) (_ map[string][]*reqForNode, _ func(), retErr error) {
+func newBuildRequests(ctx context.Context, docker *dockerutil.Client, cfg *confutil.Config, drivers map[string][]*noderesolver.ResolvedNode, w progress.Writer, opts map[string]Options) (_ map[string][]*reqForNode, _ func(error), retErr error) {
 	reqForNodes := make(map[string][]*reqForNode)
 
-	var releasers []func()
-	releaseAll := func() {
+	var releasers []func(error)
+	releaseAll := func(inErr error) {
 		for _, fn := range releasers {
-			fn()
+			fn(inErr)
 		}
 	}
 	defer func() {
 		if retErr != nil {
-			releaseAll()
+			releaseAll(retErr)
 		}
 	}()
 
@@ -432,7 +432,9 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 	if err != nil {
 		return nil, err
 	}
-	defer release()
+	defer func() {
+		release(err)
+	}()
 
 	// validate that all links between targets use same drivers
 	if err := validateTargetLinks(reqForNodes, drivers, opts); err != nil {
