@@ -10,6 +10,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/platforms"
@@ -32,6 +33,9 @@ import (
 type Policy struct {
 	opt   Opt
 	funcs []fun
+
+	denyMu          sync.Mutex
+	denyIdentifiers map[string]struct{}
 }
 
 type state struct {
@@ -82,6 +86,43 @@ func (p *Policy) log(level logrus.Level, format string, v ...any) {
 		return
 	}
 	p.opt.Log(level, fmt.Sprintf(format, v...))
+}
+
+func (p *Policy) recordDenyIdentifier(req *policysession.CheckPolicyRequest) {
+	if p == nil || req == nil || req.Source == nil || req.Source.Source == nil {
+		return
+	}
+
+	p.denyMu.Lock()
+	defer p.denyMu.Unlock()
+
+	if p.denyIdentifiers == nil {
+		p.denyIdentifiers = make(map[string]struct{})
+	}
+	id := strings.TrimSpace(req.Source.Source.Identifier)
+	if id == "" {
+		return
+	}
+	p.denyIdentifiers[id] = struct{}{}
+}
+
+func (p *Policy) IsPolicyError(err error) bool {
+	if p == nil || err == nil {
+		return false
+	}
+	errText := err.Error()
+	// TODO: replace this string matching with a typed BuildKit error that is
+	// always attached for policy DENY decisions.
+	p.denyMu.Lock()
+	defer p.denyMu.Unlock()
+	for id := range p.denyIdentifiers {
+		pattern := fmt.Sprintf("source %q not allowed by policy: action %s", id, moby_buildkit_v1_sourcepolicy.PolicyAction_DENY.String())
+		if strings.Contains(errText, pattern) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (p *Policy) CheckPolicy(ctx context.Context, req *policysession.CheckPolicyRequest) (*policysession.DecisionResponse, *gwpb.ResolveSourceMetaRequest, error) {
@@ -306,6 +347,9 @@ func (p *Policy) CheckPolicy(ctx context.Context, req *policysession.CheckPolicy
 	p.log(logrus.InfoLevel, "policy decision for source %s: %s", sourceName(req), resp.Action)
 	for _, dm := range resp.DenyMessages {
 		p.log(logrus.InfoLevel, " - %s", dm.Message)
+	}
+	if resp.Action == moby_buildkit_v1_sourcepolicy.PolicyAction_DENY {
+		p.recordDenyIdentifier(req)
 	}
 
 	return resp, nil, nil

@@ -1,11 +1,13 @@
 package tests
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/containerd/continuity/fs/fstest"
@@ -13,6 +15,7 @@ import (
 	"github.com/distribution/reference"
 	"github.com/docker/buildx/util/gitutil"
 	"github.com/docker/buildx/util/gitutil/gittestutil"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/testutil"
@@ -25,6 +28,7 @@ import (
 var policyBuildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildPolicyAllow,
 	testBuildPolicyDeny,
+	testBuildPolicyDenyProgressStream,
 	testBuildPolicyImageName,
 	testBuildPolicyEnv,
 	testBuildPolicyHTTP,
@@ -101,6 +105,80 @@ decision := {"allow": allow, "deny_msg": deny_msg}
 	require.Contains(t, string(out), "loading policies "+policyPath)
 	require.Contains(t, string(out), "policy decision for source")
 	require.Contains(t, string(out), "DENY")
+}
+
+func testBuildPolicyDenyProgressStream(t *testing.T, sb integration.Sandbox) {
+	skipNoCompatBuildKit(t, sb, ">= 0.26.0-0", "policy input requires BuildKit v0.26.0+")
+	dockerfile := []byte(`
+FROM busybox:latest
+RUN echo policy-nope
+`)
+	policyFile := []byte(`
+package docker
+
+default allow = false
+
+allow if not input.image
+
+decision := {"allow": allow}
+`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("policy.rego", policyFile, 0600),
+	)
+	policyPath := filepath.Join(dir, "policy.rego")
+
+	cmd := buildxCmd(sb, withDir(dir), withArgs(
+		"build",
+		"--progress=rawjson",
+		"--policy", "filename="+policyPath,
+		"--output=type=cacheonly",
+		dir,
+	))
+	out, err := cmd.CombinedOutput()
+	outStr := string(out)
+	require.Error(t, err, outStr)
+
+	policyVertexName := "loading policies " + policyPath
+	sawPolicyVertex := false
+	sawPolicyCompleted := false
+	policyVertexDigest := ""
+	policyVertexError := ""
+
+	for line := range strings.SplitSeq(outStr, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var st client.SolveStatus
+		require.NoError(t, json.Unmarshal([]byte(line), &st), line)
+		for _, v := range st.Vertexes {
+			if v == nil {
+				continue
+			}
+			if v.Name == policyVertexName {
+				sawPolicyVertex = true
+				if v.Digest != "" {
+					policyVertexDigest = string(v.Digest)
+				}
+			}
+			if policyVertexDigest == "" || string(v.Digest) != policyVertexDigest {
+				continue
+			}
+			if v.Completed != nil {
+				sawPolicyCompleted = true
+			}
+			if v.Error != "" {
+				policyVertexError = v.Error
+			}
+		}
+	}
+
+	require.True(t, sawPolicyVertex, outStr)
+	require.True(t, sawPolicyCompleted, outStr)
+	require.Contains(t, policyVertexError, "not allowed by policy", outStr)
+	require.Contains(t, outStr, "not allowed by policy")
 }
 
 func testBuildPolicyImageName(t *testing.T, sb integration.Sandbox) {
