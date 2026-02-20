@@ -10,47 +10,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPolicyIsPolicyErrorMatchesRecordedSource(t *testing.T) {
-	p := NewPolicy(Opt{})
-	req := &policysession.CheckPolicyRequest{
-		Source: &gwpb.ResolveSourceMetaResponse{
-			Source: &solverpb.SourceOp{
-				Identifier: "docker-image://busybox:latest",
-			},
+func TestPolicyIsPolicyError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "matches-recorded-source",
+			err:  errors.New("failed to solve: error evaluating the source policy: source \"docker-image://busybox:latest\" not allowed by policy: action DENY"),
+			want: true,
+		},
+		{
+			name: "does-not-match-without-buildkit-pattern",
+			err:  errors.New("failed to parse dockerfile for docker-image://busybox:latest"),
+			want: false,
+		},
+		{
+			name: "does-not-match-unrelated-error",
+			err:  errors.New("failed to solve: error evaluating the source policy: source \"docker-image://alpine:latest\" not allowed by policy: action DENY"),
+			want: false,
 		},
 	}
-	p.recordDenyIdentifier(req)
 
-	err := errors.New("failed to solve: error evaluating the source policy: source \"docker-image://busybox:latest\" not allowed by policy: action DENY")
-	require.True(t, p.IsPolicyError(err))
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewPolicy(Opt{})
+			req := &policysession.CheckPolicyRequest{
+				Source: &gwpb.ResolveSourceMetaResponse{
+					Source: &solverpb.SourceOp{
+						Identifier: "docker-image://busybox:latest",
+					},
+				},
+			}
+			p.recordDenyIdentifier(req)
 
-func TestPolicyIsPolicyErrorDoesNotMatchWithoutBuildkitPattern(t *testing.T) {
-	p := NewPolicy(Opt{})
-	req := &policysession.CheckPolicyRequest{
-		Source: &gwpb.ResolveSourceMetaResponse{
-			Source: &solverpb.SourceOp{
-				Identifier: "docker-image://busybox:latest",
-			},
-		},
+			require.Equal(t, tt.want, p.IsPolicyError(tt.err))
+		})
 	}
-	p.recordDenyIdentifier(req)
-
-	err := errors.New("failed to parse dockerfile for docker-image://busybox:latest")
-	require.False(t, p.IsPolicyError(err))
-}
-
-func TestPolicyIsPolicyErrorDoesNotMatchUnrelatedError(t *testing.T) {
-	p := NewPolicy(Opt{})
-	req := &policysession.CheckPolicyRequest{
-		Source: &gwpb.ResolveSourceMetaResponse{
-			Source: &solverpb.SourceOp{
-				Identifier: "docker-image://busybox:latest",
-			},
-		},
-	}
-	p.recordDenyIdentifier(req)
-
-	err := errors.New("failed to solve: error evaluating the source policy: source \"docker-image://alpine:latest\" not allowed by policy: action DENY")
-	require.False(t, p.IsPolicyError(err))
 }
